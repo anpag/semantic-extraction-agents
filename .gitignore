@@ -1,7 +1,6 @@
-node_modules/
-venv/
-.env
-*.pyc
 __pycache__/
-.terraform/
-*.tfstate*
+*.pyc
+venv/
+.pytest_cache/
+extracted_real_data.json
+tmp_out.json
