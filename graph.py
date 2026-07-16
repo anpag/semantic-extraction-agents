@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 PROJECT_ID = os.environ.get("PROJECT_ID", "identity-res-e2e-10022026")
 LOCATION = os.environ.get("LOCATION", "global")
-MODEL_NAME = "gemini-3.1-pro"
+MODEL_NAME = "gemini-3.5-flash"
 
 # --- State Definition ---
 class GraphState(TypedDict):
