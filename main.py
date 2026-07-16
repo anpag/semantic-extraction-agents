@@ -3,11 +3,18 @@ import json
 import base64
 import logging
 from flask import Flask, request, jsonify
-from extractor import process_document
+from google.cloud import pubsub_v1
+from graph import process_document_with_graph
 
 logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
+
+PROJECT_ID = os.environ.get("PROJECT_ID", "identity-res-e2e-10022026")
+OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "raw-graph-events")
+
+publisher = pubsub_v1.PublisherClient()
+topic_path = publisher.topic_path(PROJECT_ID, OUTPUT_TOPIC)
 
 @app.route("/", methods=["POST"])
 def pubsub_push():
@@ -39,7 +46,21 @@ def pubsub_push():
                 return ("", 204)
                 
             logging.info(f"Triggered extraction for gs://{bucket_name}/{file_name}")
-            process_document(bucket_name, file_name)
+            
+            # Execute the LangGraph workflow
+            final_state = process_document_with_graph(bucket_name, file_name)
+            
+            # Publish the aggregated triples to Pub/Sub
+            payload = {
+                "source_file": f"gs://{bucket_name}/{file_name}",
+                "extracted_triples": final_state.get("extracted_triples", []),
+                "errors": final_state.get("errors", [])
+            }
+            
+            message_bytes = json.dumps(payload).encode("utf-8")
+            future = publisher.publish(topic_path, data=message_bytes)
+            message_id = future.result()
+            logging.info(f"Successfully published extraction event to Pub/Sub. Message ID: {message_id}")
             
         except Exception as e:
             logging.error(f"Error processing document: {e}")
