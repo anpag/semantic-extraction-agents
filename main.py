@@ -50,10 +50,12 @@ def pubsub_push():
             # Execute the LangGraph workflow
             final_state = process_document_with_graph(bucket_name, file_name)
             
-            # Publish the aggregated triples to Pub/Sub
+            # Publish the aggregated extractions to Pub/Sub
             payload = {
                 "source_file": f"gs://{bucket_name}/{file_name}",
-                "extracted_triples": final_state.get("extracted_triples", []),
+                "extracted_nodes": final_state.get("extracted_nodes", []),
+                "extracted_edges": final_state.get("extracted_edges", []),
+                "unbound_knowledge": final_state.get("unbound_knowledge", []),
                 "errors": final_state.get("errors", [])
             }
             
