@@ -18,7 +18,9 @@ def test():
         "document_uri": dummy_text,
         "primary_classes": [],
         "chunks": [],
-        "extracted_triples": [],
+        "extracted_nodes": [],
+        "extracted_edges": [],
+        "unbound_knowledge": [],
         "errors": []
     }
     
