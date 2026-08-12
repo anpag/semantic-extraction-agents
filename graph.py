@@ -8,7 +8,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from langchain_google_vertexai import ChatVertexAI
 from pydantic import BaseModel, Field
 
-PROJECT_ID = os.environ.get("PROJECT_ID", "identity-res-e2e-10022026")
+PROJECT_ID = os.environ.get("PROJECT_ID", "ontology-data-platform")
 LOCATION = os.environ.get("LOCATION", "global")
 MODEL_NAME = "gemini-3.5-flash"
 

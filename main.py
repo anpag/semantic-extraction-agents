@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.INFO)
 
 app = Flask(__name__)
 
-PROJECT_ID = os.environ.get("PROJECT_ID", "identity-res-e2e-10022026")
+PROJECT_ID = os.environ.get("PROJECT_ID", "ontology-data-platform")
 OUTPUT_TOPIC = os.environ.get("OUTPUT_TOPIC", "raw-graph-events")
 
 publisher = pubsub_v1.PublisherClient()
