@@ -1,132 +1,214 @@
 import os
-import json
 import logging
-from typing import TypedDict, List, Dict, Any, Annotated
-import operator
+import asyncio
+from typing import Dict, Any, List, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
+
 from langgraph.graph import StateGraph, END
-from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.messages import HumanMessage
 from langchain_google_vertexai import ChatVertexAI
-from pydantic import BaseModel, Field
 
-PROJECT_ID = os.environ.get("PROJECT_ID", "ontology-data-platform")
-LOCATION = os.environ.get("LOCATION", "global")
-MODEL_NAME = "gemini-3.5-flash"
+from models import ChunkPlan, HolisticPlan, Triple, ExtractionResult, GraphState
+from schema_retriever import DynamicSchemaRetriever
+from document_loader import build_multimodal_content
 
-# --- State Definition ---
-class GraphState(TypedDict):
-    bucket_name: str
-    file_name: str
-    document_uri: str
-    primary_classes: List[str]
-    chunks: List[Dict[str, Any]]
-    extracted_nodes: Annotated[list, operator.add]
-    extracted_edges: Annotated[list, operator.add]
-    unbound_knowledge: Annotated[list, operator.add]
-    errors: Annotated[list, operator.add]
+logger = logging.getLogger(__name__)
 
-# --- Structured Outputs ---
-class ChunkPlan(BaseModel):
-    chunk_id: str = Field(description="Unique ID for this chunk")
-    page_range: str = Field(description="Pages covered, e.g. 1-5")
-    description: str = Field(description="What this section is about")
+# Configurable environment settings - zero hardcoded IDs
+PROJECT_ID = os.environ.get("PROJECT_ID") or os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("GCP_PROJECT")
+LOCATION = os.environ.get("LOCATION", "us-central1")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-1.5-flash")
+MAX_CONCURRENT_CHUNKS = int(os.environ.get("MAX_CONCURRENT_CHUNKS", "5"))
 
-class HolisticPlan(BaseModel):
-    primary_classes: List[str] = Field(description="The overarching domain classes for this document")
-    chunks: List[ChunkPlan] = Field(description="The chunking strategy for the document")
+def get_llm(structured_type=None):
+    """Instantiates ChatVertexAI with configurable model, project, and location."""
+    kwargs = {
+        "model": MODEL_NAME,
+        "location": LOCATION,
+        "temperature": 0.0,
+    }
+    if PROJECT_ID:
+        kwargs["project"] = PROJECT_ID
+    llm = ChatVertexAI(**kwargs)
+    if structured_type:
+        return llm.with_structured_output(structured_type)
+    return llm
 
-class ExtractedNode(BaseModel):
-    entity_name: str = Field(description="The unique canonical name or label of the entity")
-    ontology_class: str = Field(description="The exact ontology class name (e.g., PolymerSynthesis, LapShearTest)")
-    raw_properties: Dict[str, Any] = Field(default_factory=dict, description="Key-value property pairs extracted for this entity")
+# Exponential backoff retry handler for Vertex AI rate limits & transient errors
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential_jitter(initial=1.0, max=30.0, exp_base=2),
+    reraise=True
+)
+async def _invoke_structured_llm_async(structured_llm, messages: List[Any]):
+    """Invokes structured LLM with retry logic."""
+    if hasattr(structured_llm, "ainvoke"):
+        return await structured_llm.ainvoke(messages)
+    return await asyncio.to_thread(structured_llm.invoke, messages)
 
-class ExtractedEdge(BaseModel):
-    source_entity: str = Field(description="The source entity name")
-    target_entity: str = Field(description="The target entity name")
-    relationship_type: str = Field(description="The ontological relationship predicate (e.g., hasProperty, testedOn)")
-    evidence: str = Field(description="Textual evidence or quote from the document supporting this edge")
+async def holistic_planner_async(state: GraphState) -> Dict[str, Any]:
+    """Agent 1: Ingests document / PDF, establishes overarching domain classes and chunking strategy."""
+    doc_uri = state.get("document_uri", "")
+    logger.info(f"Running Holistic Planner on {doc_uri}...")
+    
+    structured_llm = get_llm(HolisticPlan)
+    
+    prompt = (
+        f"Analyze the document at {doc_uri}.\n"
+        "Identify the primary domain ontology classes (e.g., PolymerSynthesis, LapShearTest, Material, ChemicalCompound).\n"
+        "Devise a chunking plan dividing the document into logical sections (e.g., Introduction, Synthesis Method, Characterization, Results)."
+    )
+    
+    contents = build_multimodal_content(doc_uri, prompt)
+    messages = [HumanMessage(content=contents)]
+    
+    try:
+        result: HolisticPlan = await _invoke_structured_llm_async(structured_llm, messages)
+        chunks_dict = [
+            {"chunk_id": c.chunk_id, "page_range": c.page_range, "description": c.description}
+            for c in result.chunks
+        ]
+        
+        # Initialize schema retriever and fetch schema slice for detected primary classes
+        retriever = DynamicSchemaRetriever(project_id=PROJECT_ID)
+        schema_slice = await retriever.get_schema_slice(result.primary_classes)
+        
+        return {
+            "primary_classes": result.primary_classes,
+            "chunks": chunks_dict,
+            "schema_context": schema_slice
+        }
+    except Exception as e:
+        logger.error(f"Holistic Planner failed for {doc_uri}: {e}")
+        return {
+            "primary_classes": ["DocumentSection"],
+            "chunks": [{"chunk_id": "chunk-001", "page_range": "all", "description": "Full document content"}],
+            "schema_context": {},
+            "errors": [f"Holistic Planner error: {str(e)}"]
+        }
 
-class UnboundInsight(BaseModel):
-    insight: str = Field(description="Abstract summary or high-level finding that does not map directly to an ontology triple")
-    category: str = Field(description="Inferred category or domain of this insight")
-
-class ExtractionResult(BaseModel):
-    extracted_nodes: List[ExtractedNode] = Field(default_factory=list, description="Extracted entity nodes")
-    extracted_edges: List[ExtractedEdge] = Field(default_factory=list, description="Extracted relationship edges")
-    unbound_knowledge: List[UnboundInsight] = Field(default_factory=list, description="Unstructured insights")
-
-# --- Nodes ---
 def holistic_planner(state: GraphState) -> Dict[str, Any]:
-    """Agent 1: Reads the document and establishes the overarching classes and chunking strategy."""
-    logging.info(f"Running Holistic Planner on {state['document_uri']}...")
+    """Synchronous wrapper for holistic planner node."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply()
+            return loop.run_until_complete(holistic_planner_async(state))
+        else:
+            return asyncio.run(holistic_planner_async(state))
+    except Exception:
+        return asyncio.run(holistic_planner_async(state))
+
+async def _extract_single_chunk(
+    chunk: Dict[str, Any],
+    state: GraphState,
+    schema_prompt: str,
+    semaphore: asyncio.Semaphore,
+    structured_llm
+) -> Dict[str, Any]:
+    """Extracts triples for a single chunk concurrently under semaphore and rate-limit retry."""
+    async with semaphore:
+        chunk_id = chunk.get("chunk_id", "unknown")
+        page_range = chunk.get("page_range", "")
+        description = chunk.get("description", "")
+        doc_uri = state.get("document_uri", "")
+        
+        logger.info(f"Targeted extraction on chunk {chunk_id} ({page_range}): {description}")
+        
+        prompt = f"""
+        Extract knowledge triples from document section: {description} (Pages/Section: {page_range}).
+        Source Document: {doc_uri}
+        
+        CRITICAL RULES:
+        1. Extract complete, verified knowledge triples with strict typing:
+           - subject: URI or canonical identifier
+           - subject_class: identified ontology class
+           - predicate: valid ontology relationship (e.g. hasProperty, testedOn, yieldsProduct)
+           - object: URI, identifier, or literal
+           - object_class: target class or datatype (e.g. LapShearTest, xsd:float, ChemicalCompound)
+           - confidence: extraction certainty score (0.0 - 1.0)
+           - unit: QUDT/OM unit string if numeric measurement (e.g., MegaPA, Cel, MPa, g/mol)
+           - value: numeric value if numeric measurement
+           - chunk_id: '{chunk_id}'
+           - source_file: '{doc_uri}'
+        
+        2. Strictly conform to this Dynamic Ontology Schema:
+        {schema_prompt}
+        """
+        
+        contents = build_multimodal_content(doc_uri, prompt)
+        messages = [HumanMessage(content=contents)]
+        
+        try:
+            result: ExtractionResult = await _invoke_structured_llm_async(structured_llm, messages)
+            triples = []
+            for t in result.triples:
+                t_dict = t.model_dump()
+                t_dict["chunk_id"] = chunk_id
+                t_dict["source_file"] = doc_uri
+                triples.append(t_dict)
+            return {"triples": triples, "errors": []}
+        except Exception as e:
+            err_msg = f"Failed to extract chunk {chunk_id}: {str(e)}"
+            logger.error(err_msg)
+            return {"triples": [], "errors": [err_msg]}
+
+async def targeted_extraction_async(state: GraphState) -> Dict[str, Any]:
+    """Agent 1.5 & Agent 2: Concurrently processes document chunks with dynamic schema and exponential backoff."""
+    chunks = state.get("chunks", [])
+    if not chunks:
+        return {"extracted_triples": [], "errors": ["No chunks available for extraction."]}
     
-    llm = ChatVertexAI(model=MODEL_NAME, project=PROJECT_ID, location=LOCATION, temperature=0.0)
-    structured_llm = llm.with_structured_output(HolisticPlan)
+    logger.info(f"Running Targeted Extraction on {len(chunks)} chunks concurrently (max concurrency: {MAX_CONCURRENT_CHUNKS})...")
     
-    # In a real scenario, we'd pass the actual PDF bytes or URI to Gemini.
-    # We simulate passing the document URI for context.
-    prompt = f"Analyze the document at {state['document_uri']}. Identify the overarching ontology classes (e.g., PolymerSynthesis, LapShearTest) and create a chunking strategy based on logical sections (Introduction, Methods, Results)."
+    # Retrieve dynamic schema
+    retriever = DynamicSchemaRetriever(project_id=PROJECT_ID)
+    schema_context = state.get("schema_context")
+    if not schema_context:
+        schema_context = await retriever.get_schema_slice(state.get("primary_classes", []))
+    schema_prompt = retriever.format_schema_for_prompt(schema_context)
     
-    result = structured_llm.invoke([HumanMessage(content=prompt)])
+    structured_llm = get_llm(ExtractionResult)
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHUNKS)
     
-    chunks_dict = [{"chunk_id": c.chunk_id, "page_range": c.page_range, "description": c.description} for c in result.chunks]
+    tasks = [
+        _extract_single_chunk(chunk, state, schema_prompt, semaphore, structured_llm)
+        for chunk in chunks
+    ]
     
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    all_triples = []
+    all_errors = []
+    
+    for r in results:
+        if isinstance(r, Exception):
+            all_errors.append(str(r))
+        elif isinstance(r, dict):
+            all_triples.extend(r.get("triples", []))
+            all_errors.extend(r.get("errors", []))
+            
     return {
-        "primary_classes": result.primary_classes,
-        "chunks": chunks_dict
+        "extracted_triples": all_triples,
+        "errors": all_errors
     }
 
 def targeted_extraction(state: GraphState) -> Dict[str, Any]:
-    """Agent 1.5 & Agent 2: For each chunk, retrieves local schema and extracts typed nodes/edges."""
-    logging.info(f"Running Targeted Extraction on {len(state['chunks'])} chunks...")
-    
-    llm = ChatVertexAI(model=MODEL_NAME, project=PROJECT_ID, location=LOCATION, temperature=0.0)
-    structured_llm = llm.with_structured_output(ExtractionResult)
-    
-    all_nodes = []
-    all_edges = []
-    all_unbound = []
-    
-    # Map-Reduce parallel loop (simplified for synchronous execution in this mock)
-    for chunk in state['chunks']:
-        logging.info(f"Processing chunk {chunk['chunk_id']} ({chunk['page_range']}): {chunk['description']}")
-        
-        # --- AGENT 1.5: Local Schema Retrieval (Mocked) ---
-        # Here we would query the API/BigQuery using the primary_classes + chunk.description
-        local_schema = f"Schema for {chunk['description']}: Allowed relationships are hasProperty, hasValue, testedOn."
-        
-        # --- AGENT 2: Targeted Extraction ---
-        prompt = f"""
-        Extract structured nodes, relationships, and unbound insights from the document section: {chunk['description']} (Pages {chunk['page_range']}).
-        Document URI: {state['document_uri']}
-        
-        CRITICAL RULES:
-        1. Extract typed entities with their canonical entity_name, valid ontology_class, and key-value properties.
-        2. Extract valid ontological relationships between entities (source_entity, target_entity, relationship_type, evidence).
-        3. Adhere to this local schema: {local_schema}
-        4. Global document classes identified: {', '.join(state.get('primary_classes', []))}
-        """
-        
-        try:
-            result = structured_llm.invoke([HumanMessage(content=prompt)])
-            if hasattr(result, "extracted_nodes"):
-                all_nodes.extend([n.model_dump() for n in result.extracted_nodes])
-            if hasattr(result, "extracted_edges"):
-                all_edges.extend([e.model_dump() for e in result.extracted_edges])
-            if hasattr(result, "unbound_knowledge"):
-                all_unbound.extend([u.model_dump() for u in result.unbound_knowledge])
-        except Exception as e:
-            logging.error(f"Failed to extract chunk {chunk['chunk_id']}: {e}")
-            return {"errors": [str(e)]}
-            
-    return {
-        "extracted_nodes": all_nodes,
-        "extracted_edges": all_edges,
-        "unbound_knowledge": all_unbound
-    }
+    """Synchronous wrapper for targeted extraction node."""
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            import nest_asyncio
+            nest_asyncio.apply()
+            return loop.run_until_complete(targeted_extraction_async(state))
+        else:
+            return asyncio.run(targeted_extraction_async(state))
+    except Exception:
+        return asyncio.run(targeted_extraction_async(state))
 
 # --- Graph Compilation ---
 workflow = StateGraph(GraphState)
-
 workflow.add_node("planner", holistic_planner)
 workflow.add_node("extractor", targeted_extraction)
 
@@ -136,20 +218,38 @@ workflow.add_edge("extractor", END)
 
 app = workflow.compile()
 
-def process_document_with_graph(bucket_name: str, file_name: str) -> Dict[str, Any]:
-    """Entrypoint function to run the LangGraph workflow."""
+async def aprocess_document_with_graph(bucket_name: str, file_name: str) -> Dict[str, Any]:
+    """Asynchronous entrypoint for the LangGraph workflow."""
+    doc_uri = f"gs://{bucket_name}/{file_name}" if bucket_name else file_name
     initial_state = {
-        "bucket_name": bucket_name,
+        "bucket_name": bucket_name or "",
         "file_name": file_name,
-        "document_uri": f"gs://{bucket_name}/{file_name}",
+        "document_uri": doc_uri,
         "primary_classes": [],
         "chunks": [],
-        "extracted_nodes": [],
-        "extracted_edges": [],
-        "unbound_knowledge": [],
+        "schema_context": {},
+        "extracted_triples": [],
         "errors": []
     }
     
-    logging.info("Invoking LangGraph Workflow...")
+    logger.info(f"Invoking LangGraph Workflow for {doc_uri}...")
+    final_state = await app.ainvoke(initial_state)
+    return final_state
+
+def process_document_with_graph(bucket_name: str, file_name: str) -> Dict[str, Any]:
+    """Synchronous entrypoint for the LangGraph workflow."""
+    doc_uri = f"gs://{bucket_name}/{file_name}" if bucket_name else file_name
+    initial_state = {
+        "bucket_name": bucket_name or "",
+        "file_name": file_name,
+        "document_uri": doc_uri,
+        "primary_classes": [],
+        "chunks": [],
+        "schema_context": {},
+        "extracted_triples": [],
+        "errors": []
+    }
+    
+    logger.info(f"Invoking LangGraph Workflow for {doc_uri}...")
     final_state = app.invoke(initial_state)
     return final_state
